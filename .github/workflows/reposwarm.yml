@@ -1,0 +1,247 @@
+name: RepoSwarm Architecture Documentation
+on:
+  schedule:
+    # Run daily at 2 AM EST (7 AM UTC)
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      target_repos:
+        description: 'Comma-separated repo names (leave empty for all)'
+        required: false
+        type: string
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  TARGET_ORG: breverdbidder
+  TARGET_REPO: architecture-docs
+
+jobs:
+  discover-repos:
+    name: Discover Active Repositories
+    runs-on: ubuntu-latest
+    outputs:
+      repos: ${{ steps.discover.outputs.repos }}
+    steps:
+      - name: Discover repos with recent activity
+        id: discover
+        run: |
+          # Get all repos from organization
+          if [ -z "${{ inputs.target_repos }}" ]; then
+            REPOS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/orgs/$TARGET_ORG/repos?per_page=100" | \
+              jq -r '[.[] | select(.archived == false and .pushed_at > (now - 31536000 | todate)) | .name] | join(",")')
+          else
+            REPOS="${{ inputs.target_repos }}"
+          fi
+          echo "repos=$REPOS" >> $GITHUB_OUTPUT
+          echo "Discovered repos: $REPOS"
+
+  analyze-repo:
+    name: Analyze Repository
+    needs: discover-repos
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        repo: ${{ fromJson(format('["{0}"]', needs.discover-repos.outputs.repos)) }}
+      max-parallel: 3
+      fail-fast: false
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_ORG }}/${{ matrix.repo }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: source-repo
+
+      - name: Get repo metadata
+        id: metadata
+        run: |
+          cd source-repo
+          LAST_COMMIT=$(git log -1 --format=%H)
+          LAST_COMMIT_DATE=$(git log -1 --format=%cI)
+          echo "commit=$LAST_COMMIT" >> $GITHUB_OUTPUT
+          echo "commit_date=$LAST_COMMIT_DATE" >> $GITHUB_OUTPUT
+          
+          # Detect repo type
+          REPO_TYPE="generic"
+          if [ -f "package.json" ]; then REPO_TYPE="javascript"; fi
+          if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then REPO_TYPE="python"; fi
+          if [ -d ".github/workflows" ]; then REPO_TYPE="${REPO_TYPE}_github_actions"; fi
+          echo "repo_type=$REPO_TYPE" >> $GITHUB_OUTPUT
+
+      - name: Check cache for previous analysis
+        id: cache
+        run: |
+          # Check if we've already analyzed this commit with current prompt version
+          CACHE_KEY="${{ matrix.repo }}_${{ steps.metadata.outputs.commit }}_v1.0"
+          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/$TARGET_ORG/$TARGET_REPO/contents/${{ matrix.repo }}.arch.md" \
+            > cache_check.json
+          
+          if [ $(cat cache_check.json | jq -r '.message // empty') != "Not Found" ]; then
+            EXISTING_CONTENT=$(cat cache_check.json | jq -r '.content' | base64 -d)
+            if echo "$EXISTING_CONTENT" | grep -q "commit: ${{ steps.metadata.outputs.commit }}"; then
+              echo "cache_hit=true" >> $GITHUB_OUTPUT
+              echo "Cached analysis found for commit ${{ steps.metadata.outputs.commit }}"
+            else
+              echo "cache_hit=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "cache_hit=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Python
+        if: steps.cache.outputs.cache_hit != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        if: steps.cache.outputs.cache_hit != 'true'
+        run: |
+          pip install anthropic aiohttp
+
+      - name: Analyze repository with Claude
+        if: steps.cache.outputs.cache_hit != 'true'
+        env:
+          REPO_NAME: ${{ matrix.repo }}
+          REPO_TYPE: ${{ steps.metadata.outputs.repo_type }}
+          COMMIT_HASH: ${{ steps.metadata.outputs.commit }}
+        run: |
+          cat > analyze.py << 'PYTHON_EOF'
+          import os
+          import json
+          import anthropic
+          from pathlib import Path
+
+          client = anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
+          
+          repo_name = os.environ['REPO_NAME']
+          repo_type = os.environ['REPO_TYPE']
+          commit_hash = os.environ['COMMIT_HASH']
+          
+          # Build context from repo files
+          repo_path = Path('source-repo')
+          context_files = []
+          
+          # Priority files to include
+          priority_patterns = [
+              'README.md', 'CLAUDE.md', 'PROJECT_STATE.json',
+              'requirements.txt', 'package.json', 'pyproject.toml',
+              '.github/workflows/*.yml', 'src/**/*.py', 'agents/**/*.py'
+          ]
+          
+          for pattern in priority_patterns:
+              for file in repo_path.glob(pattern):
+                  if file.is_file() and file.stat().st_size < 100000:  # Max 100KB per file
+                      try:
+                          content = file.read_text()
+                          context_files.append({
+                              'path': str(file.relative_to(repo_path)),
+                              'content': content
+                          })
+                      except:
+                          pass
+          
+          # Build investigation prompt based on repo type
+          base_prompt = f"""You are analyzing the repository '{repo_name}' (type: {repo_type}).
+
+          Generate comprehensive architecture documentation following this structure:
+
+          # {repo_name} - Architecture Documentation
+
+          ## Repository Overview
+          - Purpose and primary function
+          - Key technologies and frameworks
+          - Repository type: {repo_type}
+          - Last analyzed commit: {commit_hash}
+
+          ## Architecture Patterns
+          [Identify and document key architectural patterns used]
+
+          ## Key Components
+          [List and describe major modules, services, or components]
+
+          ## Data Flow
+          [Describe how data moves through the system]
+
+          ## Dependencies
+          [List critical dependencies and integrations]
+
+          ## Deployment & Operations
+          [How this repository is deployed and operated]
+
+          ## AI Agent Notes
+          [Specific guidance for AI agents working with this codebase]
+
+          Context files from repository:
+          """
+          
+          for cf in context_files[:20]:  # Limit to 20 files
+              base_prompt += f"\n\n--- {cf['path']} ---\n{cf['content'][:5000]}"  # Max 5KB per file
+          
+          # Call Claude Sonnet 4.5
+          message = client.messages.create(
+              model="claude-sonnet-4-20250514",
+              max_tokens=4000,
+              messages=[{
+                  "role": "user",
+                  "content": base_prompt
+              }]
+          )
+          
+          arch_doc = message.content[0].text
+          
+          # Add metadata footer
+          arch_doc += f"""
+
+          ---
+          **Metadata:**
+          - Generated: {os.popen('date -Iseconds').read().strip()}
+          - Commit: {commit_hash}
+          - Prompt Version: v1.0
+          - Analyzed by: Claude Sonnet 4.5
+          """
+          
+          # Save output
+          output_path = Path(f'{repo_name}.arch.md')
+          output_path.write_text(arch_doc)
+          print(f"Architecture documentation generated: {output_path}")
+          PYTHON_EOF
+          
+          python analyze.py
+
+      - name: Commit architecture doc to target repo
+        if: steps.cache.outputs.cache_hit != 'true'
+        run: |
+          # Clone target repo
+          git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/$TARGET_ORG/$TARGET_REPO.git target-repo
+          cd target-repo
+          
+          # Copy generated doc
+          cp ../${{ matrix.repo }}.arch.md .
+          
+          # Configure git
+          git config user.name "RepoSwarm Bot"
+          git config user.email "reposwarm@biddeed.ai"
+          
+          # Commit and push
+          git add ${{ matrix.repo }}.arch.md
+          git commit -m "Update architecture doc for ${{ matrix.repo }} (commit: ${{ steps.metadata.outputs.commit }})" || echo "No changes to commit"
+          git push
+
+  summary:
+    name: Generate Summary
+    needs: [discover-repos, analyze-repo]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Create summary
+        run: |
+          echo "# RepoSwarm Architecture Documentation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** $(date -Iseconds)" >> $GITHUB_STEP_SUMMARY
+          echo "**Repos Analyzed:** ${{ needs.discover-repos.outputs.repos }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**View Documentation:** [architecture-docs](https://github.com/$TARGET_ORG/$TARGET_REPO)" >> $GITHUB_STEP_SUMMARY
